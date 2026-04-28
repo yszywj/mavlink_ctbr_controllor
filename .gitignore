@@ -1,0 +1,16 @@
+# Python 缓存文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+# 虚拟环境
+venv/
+env/
+# 你的日志文件夹
+log_folder/
+# 编辑器配置
+.vscode/
+.idea/
+# 系统文件
+.DS_Store
+*.log
