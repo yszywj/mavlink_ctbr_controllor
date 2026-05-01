@@ -8,13 +8,16 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import logging
 import threading
-from .ctbr_tools import ControlParams
+from .ctbr_tools import ControlParams, DroneDataSync, ActionData, ObservationData
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("CTBRController")
 
 class CTBRController:
-    def __init__(self, connection_str='udp:0.0.0.0:14550', timeout=30, log_dir="./log_folder", thrust_output_index=None):
+    def __init__(self, connection_str='udp:0.0.0.0:14550', timeout=30, log_dir="./log_folder", thrust_output_index=None, 
+                enable_data_sync: bool = True, 
+                use_sync_condition: bool = True,
+                use_sync_queue: bool = True):
         self.master = mavutil.mavlink_connection(connection_str, timeout=timeout)
         logger.info("Waiting for heartbeat...")
         self.master.wait_heartbeat()
@@ -38,6 +41,11 @@ class CTBRController:
         # 实例化参数对象，并加一把锁保护
         self.current_params = ControlParams()
         self.param_lock = threading.Lock()
+
+        # --- 改动 2: 实例化数据同步核心 ---
+        self.data_sync: Optional[DroneDataSync] = None
+        if enable_data_sync:
+            self.data_sync = DroneDataSync(use_condition=use_sync_condition, use_queue=use_sync_queue)
 
     # OFFBOARD 保活指令
     def send_hover_setpoint(self, x=0, y=0, z=-2.5):
@@ -100,6 +108,8 @@ class CTBRController:
         if self.is_offboard_running:
             logger.info("Detected the OFFBOARD holdover function is open. Automatically shutting down...")
             self.stop_offboard_maintain()
+        # --- 改动 4: 发送前记录时间 ---
+        local_time = time.time()
         self.master.mav.set_attitude_target_send(
             0,
             self.master.target_system,
@@ -111,6 +121,16 @@ class CTBRController:
             body_yaw_rate,
             thrust
         )
+        # --- 改动 5: 发送后推送到同步中心 ---
+        if self.data_sync:
+            action = ActionData(
+                time_sent_local=local_time,
+                body_roll_rate=body_roll_rate,
+                body_pitch_rate=body_pitch_rate,
+                body_yaw_rate=body_yaw_rate,
+                thrust=thrust
+            )
+            self.data_sync.on_new_action(action)
     
     # 发送CTBR控制指令（连续）
     def set_ctbr_parameters_continuously(self, body_roll_rate=[0.0, 0.0], body_pitch_rate=[0.0, 0.0], body_yaw_rate=[0.0, 0.0], thrust=[0.0, 0.0], frequency=20):
@@ -174,6 +194,10 @@ class CTBRController:
                 y = msg.y
                 relative_alt = -msg.z
                 print(f"[PX4时间: {px4_time:>8}ms] [📌 坐标] X(前): {x:.2f} | Y(右): {y:.2f} | 高度: {relative_alt:.2f} m")
+
+            # --- 改动 3: 新增数据推送到同步中心 ---
+            if self.data_sync:
+                self.data_sync.on_new_observation(msg)
 
     def start_monitoring(self, message_ids=[30, 375, 32], freq_hz=20):
         """启动数据监听线程"""
