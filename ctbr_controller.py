@@ -165,7 +165,6 @@ class CTBRController:
             msg = self.master.recv_match(blocking=False)
             
             if not msg:
-                # 没消息时稍微歇一会，避免 CPU 100%
                 time.sleep(0.001)
                 continue
 
@@ -179,13 +178,13 @@ class CTBRController:
             if msg_type == 'ATTITUDE':
                 # 姿态消息：time_boot_ms (毫秒)
                 px4_time = msg.time_boot_ms
-                print(f"[PX4时间: {px4_time:>8}ms] [角速率] Roll: {msg.rollspeed:+.4f} | Pitch: {msg.pitchspeed:+.4f} | Yaw: {msg.yawspeed:+.4f} rad/s")
+                logger.info(f"[PX4时间: {px4_time:>8}ms] [角速率] Roll: {msg.rollspeed:+.4f} | Pitch: {msg.pitchspeed:+.4f} | Yaw: {msg.yawspeed:+.4f} rad/s")
             
             elif msg_type == 'ACTUATOR_OUTPUT_STATUS':
                 # 电机消息：time_usec (微秒) → 转毫秒
                 px4_time = msg.time_usec // 1000
                 motors = msg.actuator[:4]
-                print(f"[PX4时间: {px4_time:>8}ms] [执行器] 电机: {[f'{m:.1f}' for m in motors]}")
+                logger.info(f"[PX4时间: {px4_time:>8}ms] [执行器] 电机: {[f'{m:.1f}' for m in motors]}")
 
             elif msg_type == 'LOCAL_POSITION_NED':
                 # 位置消息：time_boot_ms (毫秒)
@@ -193,7 +192,7 @@ class CTBRController:
                 x = msg.x
                 y = msg.y
                 relative_alt = -msg.z
-                print(f"[PX4时间: {px4_time:>8}ms] [📌 坐标] X(前): {x:.2f} | Y(右): {y:.2f} | 高度: {relative_alt:.2f} m")
+                logger.info(f"[PX4时间: {px4_time:>8}ms] [📌 坐标] X(前): {x:.2f} | Y(右): {y:.2f} | 高度: {relative_alt:.2f} m")
 
             # --- 改动 3: 新增数据推送到同步中心 ---
             if self.data_sync:
@@ -205,7 +204,7 @@ class CTBRController:
             # 请求飞控发送数据流
             for msg_id in message_ids:
                 self.request_message_stream(msg_id, freq_hz)
-            print("📡 已请求数据流")
+            logger.info("📡 已请求数据流")
             
             # 启动线程
             self.is_monitoring = True
@@ -218,7 +217,7 @@ class CTBRController:
             self.is_monitoring = False
             if self.monitor_thread:
                 self.monitor_thread.join()
-            print("🛑 数据监听已停止")
+            logger.info("🛑 数据监听已停止")
 
     # ==============================================
     #  新增代码块：发送线程功能

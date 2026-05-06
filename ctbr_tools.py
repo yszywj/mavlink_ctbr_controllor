@@ -58,7 +58,8 @@ class DroneDataSync:
                  use_condition: bool = True, 
                  use_queue: bool = True,
                  action_history_len: int = 10,
-                 max_queue_size: int = 1000):
+                 max_queue_size: int = 1000,
+                 sync_window_ms: int = 50):
         """
         初始化数据同步中心
         :param use_condition: 是否启用 Condition 实时流 (推荐用于控制)
@@ -68,6 +69,7 @@ class DroneDataSync:
         """
         self._use_condition = use_condition
         self._use_queue = use_queue
+        self._sync_window_ms = sync_window_ms
 
         # --- 共享状态 ---
         self._latest_px4_time_est: int = 0  # 最新的飞控时间估算
@@ -79,6 +81,13 @@ class DroneDataSync:
             self._has_new_data = False
             self._latest_obs: ObservationData = ObservationData()
             self._action_history: Deque[ActionData] = deque(maxlen=action_history_len)
+
+            # 【新增】帧缓存：临时存放未凑齐的单条消息
+            self._frame_cache = {
+                'ATTITUDE': None,
+                'LOCAL_POSITION_NED': None,
+                'ACTUATOR_OUTPUT_STATUS': None
+            }
 
         # --- 2. Queue 机制 (完整记录) ---
         if self._use_queue:
@@ -106,13 +115,15 @@ class DroneDataSync:
         if current_px4_time > 0:
             self._latest_px4_time_est = current_px4_time
 
-        # --- Condition 模式写入 ---
+        # --- Condition 模式写入 (核心修改：先缓存，凑齐再通知) ---
         if self._use_condition:
             with self._lock:
-                # 增量更新 latest_obs 对象
-                self._update_obs_with_msg(self._latest_obs, msg, msg_type)
-                self._has_new_data = True
-                self._cv.notify()
+                # 1. 先把当前消息存入缓存
+                if msg_type in self._frame_cache:
+                    self._frame_cache[msg_type] = msg
+                
+                # 2. 【核心】尝试凑齐一帧并发出
+                self._try_emit_synced_frame()
 
         # --- Queue 模式写入 ---
         if self._use_queue:
@@ -207,6 +218,44 @@ class DroneDataSync:
     # ==============================================
     #  内部辅助函数
     # ==============================================
+    def _try_emit_synced_frame(self):
+        """
+        [线程安全] 检查缓存：如果3个消息都齐了且时间戳在同一窗口内，就更新数据并通知
+        必须在持有 self._lock 的情况下调用！
+        """
+        cache = self._frame_cache
+        
+        # 1. 检查：3个消息是不是都收到了？
+        if not (cache['ATTITUDE'] and cache['LOCAL_POSITION_NED'] and cache['ACTUATOR_OUTPUT_STATUS']):
+            return # 没凑齐，直接返回，继续等
+        
+        # 2. 【修复】安全地获取3个时间戳
+        # 先取姿态和位置的时间（这两个肯定有 time_boot_ms）
+        t_att = cache['ATTITUDE'].time_boot_ms
+        t_pos = cache['LOCAL_POSITION_NED'].time_boot_ms
+        
+        # 再处理电机时间（可能没有 time_boot_ms，没有就用姿态时间代替）
+        t_act = t_att
+        if hasattr(cache['ACTUATOR_OUTPUT_STATUS'], 'time_boot_ms'):
+            t_act = cache['ACTUATOR_OUTPUT_STATUS'].time_boot_ms
+        
+        # 3. 检查时间差
+        times = [t_att, t_pos, t_act]
+        if max(times) - min(times) > self._sync_window_ms:
+            return # 时间差太大，不是同一帧，继续等
+        
+        # 4. ✅ 凑齐了！合并成完整观测
+        self._update_obs_with_msg(self._latest_obs, cache['ATTITUDE'], 'ATTITUDE')
+        self._update_obs_with_msg(self._latest_obs, cache['LOCAL_POSITION_NED'], 'LOCAL_POSITION_NED')
+        self._update_obs_with_msg(self._latest_obs, cache['ACTUATOR_OUTPUT_STATUS'], 'ACTUATOR_OUTPUT_STATUS')
+        
+        # 5. 【关键】只通知一次！
+        self._has_new_data = True
+        self._cv.notify()
+        
+        # 6. 清空缓存，准备接收下一帧
+        self._frame_cache = {k: None for k in self._frame_cache}
+
     def _update_obs_with_msg(self, obs: ObservationData, msg, msg_type: str):
         if msg_type == 'ATTITUDE':
             obs.time_boot_ms = msg.time_boot_ms
@@ -225,8 +274,6 @@ class DroneDataSync:
             obs.vy = msg.vy
             obs.vz = msg.vz
         elif msg_type == 'ACTUATOR_OUTPUT_STATUS':
-            # 注意：ACTUATOR 时间戳可能不同步，这里我们不覆盖 time_boot_ms
-            # 只更新电机数据
             obs.motors = list(msg.actuator[:4])
 
 @dataclass
