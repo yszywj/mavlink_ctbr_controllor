@@ -4,6 +4,11 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, Deque, List
 from collections import deque
 import time
+import os
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from datetime import datetime
 
 # ==============================================
 # 1. 数据类定义 (Data Classes)
@@ -73,6 +78,7 @@ class DroneDataSync:
 
         # --- 共享状态 ---
         self._latest_px4_time_est: int = 0  # 最新的飞控时间估算
+        self._time_lock = threading.Lock()
         
         # --- 1. Condition 机制 (实时控制) ---
         if self._use_condition:
@@ -113,7 +119,8 @@ class DroneDataSync:
             current_px4_time = msg.time_usec // 1000
         
         if current_px4_time > 0:
-            self._latest_px4_time_est = current_px4_time
+            with self._time_lock:
+                self._latest_px4_time_est = current_px4_time
 
         # --- Condition 模式写入 (核心修改：先缓存，凑齐再通知) ---
         if self._use_condition:
@@ -151,7 +158,8 @@ class DroneDataSync:
         """
         # 补全飞控时间估算
         if action.time_boot_ms_est == 0:
-            action.time_boot_ms_est = self._latest_px4_time_est
+            with self._time_lock:
+                action.time_boot_ms_est = self._latest_px4_time_est
 
         # --- Condition 模式写入 ---
         if self._use_condition:
@@ -215,6 +223,15 @@ class DroneDataSync:
         except queue.Empty:
             return None
 
+    # 新增：公开的时间获取接口
+    def get_latest_px4_time_ms(self) -> int:
+        """
+        线程安全地获取当前最新的飞控时间戳
+        :return: time_boot_ms (毫秒)
+        """
+        with self._time_lock:
+            return self._latest_px4_time_est
+
     # ==============================================
     #  内部辅助函数
     # ==============================================
@@ -275,6 +292,110 @@ class DroneDataSync:
             obs.vz = msg.vz
         elif msg_type == 'ACTUATOR_OUTPUT_STATUS':
             obs.motors = list(msg.actuator[:4])
+
+# ==============================================
+# 3. 新增：仿真时间守护者 (SimTimeKeeper)
+# ==============================================
+
+class SimTimeKeeper:
+    """
+    仿真时间对齐工具类。
+    作用：替代 time.sleep() 和 asyncio.sleep()，让程序按照仿真世界的时间流速运行。
+    """
+    def __init__(self, data_sync: DroneDataSync):
+        """
+        :param data_sync: 传入 CTBRController 中的 data_sync 对象
+        """
+        if not hasattr(data_sync, '_cv'):
+            raise RuntimeError("SimTimeKeeper 需要 DroneDataSync 开启 use_condition=True (默认开启)")
+        
+        self._data_sync = data_sync
+        # 直接引用 data_sync 的锁和条件变量，实现高效唤醒
+        self._cv = data_sync._cv
+        self._lock = data_sync._lock
+
+    def now_ms(self) -> int:
+        """获取当前仿真时间 (毫秒)"""
+        return self._data_sync.get_latest_px4_time_ms()
+
+    # --- 同步阻塞接口 (用于普通线程) ---
+
+    def wait(self, seconds: float, timeout: float = None) -> bool:
+        """
+        阻塞等待，直到仿真时间流逝指定秒数。
+        替代 time.sleep(seconds)
+        
+        :param seconds: 仿真世界中需要等待的时长
+        :param timeout: 现实世界中的超时时间（防止仿真卡死导致程序死等），None为无限等待
+        :return: True 表示等待完成，False 表示现实超时
+        """
+        start_sim_ms = self._wait_for_first_tick()
+        if start_sim_ms == 0:
+            return False # 超时，没连上
+            
+        target_sim_ms = start_sim_ms + int(seconds * 1000)
+        return self._wait_until(target_sim_ms, timeout)
+
+    def wait_until(self, target_time_ms: int, timeout: float = None) -> bool:
+        """
+        阻塞等待，直到仿真时间到达某个特定的时间戳
+        """
+        return self._wait_until(target_time_ms, timeout)
+
+    # --- 异步接口 (用于 asyncio 协程) ---
+
+    async def wait_async(self, seconds: float, timeout: float = None) -> bool:
+        """
+        异步等待，用于 async def 函数中。
+        替代 await asyncio.sleep(seconds)
+        """
+        import asyncio
+        loop = asyncio.get_running_loop()
+        
+        # 把同步阻塞的逻辑放到线程池里跑，避免卡主 asyncio 事件循环
+        return await loop.run_in_executor(None, self.wait, seconds, timeout)
+
+    # ==============================================
+    #  内部私有函数
+    # ==============================================
+
+    def _wait_for_first_tick(self) -> int:
+        """内部函数：等待直到接收到第一帧数据"""
+        with self._lock:
+            while self._data_sync.get_latest_px4_time_ms() == 0:
+                # 等待 100ms，如果还没数据再检查一次
+                # 这里不做超时处理，交给外层
+                self._cv.wait(0.1)
+            return self._data_sync.get_latest_px4_time_ms()
+
+    def _wait_until(self, target_ms: int, timeout: float = None) -> bool:
+        """核心等待逻辑"""
+        start_wall_time = time.time()
+        
+        with self._lock:
+            while True:
+                current_ms = self._data_sync.get_latest_px4_time_ms()
+                
+                # 1. 检查是否到达仿真目标时间
+                if current_ms >= target_ms:
+                    return True
+                
+                # 2. 检查现实世界是否超时
+                remaining_timeout = None
+                if timeout is not None:
+                    elapsed = time.time() - start_wall_time
+                    if elapsed >= timeout:
+                        return False
+                    remaining_timeout = timeout - elapsed
+                
+                # 3. 休眠等待新数据到来 (由 on_new_observation 触发 notify)
+                # wait_for 会自动释放锁并在被通知后重新获取锁
+                self._cv.wait_for(
+                    lambda: self._data_sync.get_latest_px4_time_ms() >= target_ms,
+                    timeout=remaining_timeout
+                )
+
+
 
 @dataclass
 class ControlParams:

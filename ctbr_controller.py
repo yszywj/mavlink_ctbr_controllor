@@ -8,7 +8,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import logging
 import threading
-from .ctbr_tools import ControlParams, DroneDataSync, ActionData, ObservationData
+from .ctbr_tools import ControlParams, DroneDataSync, ActionData, ObservationData, SimTimeKeeper
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("CTBRController")
@@ -46,6 +46,15 @@ class CTBRController:
         self.data_sync: Optional[DroneDataSync] = None
         if enable_data_sync:
             self.data_sync = DroneDataSync(use_condition=use_sync_condition, use_queue=use_sync_queue)
+
+    # 新增：便捷获取时间守护者的方法
+    def get_sim_time_keeper(self) -> SimTimeKeeper:
+        """
+        获取仿真时间管理器实例
+        """
+        if not self.data_sync:
+            raise RuntimeError("必须开启 enable_data_sync=True 才能使用 SimTimeKeeper")
+        return SimTimeKeeper(self.data_sync)
 
     # OFFBOARD 保活指令
     def send_hover_setpoint(self, x=0, y=0, z=-2.5):
