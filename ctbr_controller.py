@@ -8,7 +8,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import logging
 import threading
-from .ctbr_tools import ControlParams, DroneDataSync, ActionData, ObservationData, SimTimeKeeper
+from .ctbr_tools import ControlParams, DroneDataSync, ActionData, ObservationData, SimTimeKeeper, SyncedDataLogger
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("CTBRController")
@@ -17,7 +17,8 @@ class CTBRController:
     def __init__(self, connection_str='udp:0.0.0.0:14550', timeout=30, log_dir="./log_folder", thrust_output_index=None, 
                 enable_data_sync: bool = True, 
                 use_sync_condition: bool = True,
-                use_sync_queue: bool = True):
+                use_sync_queue: bool = True, 
+                enable_logging: bool = True):
         self.master = mavutil.mavlink_connection(connection_str, timeout=timeout)
         logger.info("Waiting for heartbeat...")
         self.master.wait_heartbeat()
@@ -42,10 +43,30 @@ class CTBRController:
         self.current_params = ControlParams()
         self.param_lock = threading.Lock()
 
-        # --- 改动 2: 实例化数据同步核心 ---
+        # 初始化日志记录器
+        self._logger: Optional[SyncedDataLogger] = None
+        if enable_logging:
+            self._logger = SyncedDataLogger(log_dir=log_dir)
+
+        # 将 logger 传递给 DroneDataSync
         self.data_sync: Optional[DroneDataSync] = None
         if enable_data_sync:
-            self.data_sync = DroneDataSync(use_condition=use_sync_condition, use_queue=use_sync_queue)
+            self.data_sync = DroneDataSync(
+                use_condition=use_sync_condition, 
+                use_queue=use_sync_queue,
+                logger=self._logger # 传入 logger
+            )
+
+    # 便捷控制日志启停的方法
+    def start_logging(self):
+        """启动数据日志记录"""
+        if self._logger:
+            self._logger.start()
+
+    def stop_logging(self):
+        """停止数据日志记录 (会强制刷新缓冲区)"""
+        if self._logger:
+            self._logger.stop()
 
     # 新增：便捷获取时间守护者的方法
     def get_sim_time_keeper(self) -> SimTimeKeeper:
@@ -227,6 +248,7 @@ class CTBRController:
             if self.monitor_thread:
                 self.monitor_thread.join()
             logger.info("🛑 数据监听已停止")
+            self.stop_logging()
 
     # ==============================================
     #  新增代码块：发送线程功能

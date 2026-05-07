@@ -53,6 +53,173 @@ class SyncedData:
     """最终对齐后的数据，供 RL 使用"""
     obs: ObservationData = field(default_factory=ObservationData)
     last_action: Optional[ActionData] = None
+    received_wall_time: float = field(default_factory=time.time)
+
+# ==============================================
+# 4. 新增：同步数据日志记录器 (SyncedDataLogger)
+# ==============================================
+
+class SyncedDataLogger:
+    """
+    专门用于记录对齐后的 SyncedData
+    功能：Queue 缓冲 + 批量 Parquet 写入
+    """
+    def __init__(self, log_dir: str = "./log_folder", batch_size: int = 100):
+        self._log_dir = log_dir
+        self._batch_size = batch_size
+        
+        # 确保文件夹存在
+        os.makedirs(self._log_dir, exist_ok=True)
+        
+        # 数据队列
+        self._queue = queue.Queue(maxsize=10000)
+        
+        # 写入缓冲区
+        self._buffer: List[Dict] = []
+        
+        # 线程控制
+        self._running = False
+        self._writer_thread: Optional[threading.Thread] = None
+        
+        # 生成唯一的文件名
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._filepath = os.path.join(self._log_dir, f"trajectory_{timestamp}.parquet")
+
+    def start(self):
+        """启动日志写入线程"""
+        if self._running:
+            return
+        self._running = True
+        self._writer_thread = threading.Thread(target=self._write_loop, daemon=True)
+        self._writer_thread.start()
+        print(f"[SyncedDataLogger] 已启动，日志文件: {self._filepath}")
+
+    def stop(self):
+        """停止日志写入线程，强制刷新剩余数据"""
+        if not self._running:
+            return
+        self._running = False
+        if self._writer_thread:
+            self._writer_thread.join(timeout=2.0)
+        self._flush_buffer(force=True)
+        print(f"[SyncedDataLogger] 已停止，数据已保存")
+
+    def log_synced_data(self, data: SyncedData):
+        """
+        非阻塞写入：将对齐数据推入队列
+        这个函数会被 DroneDataSync 调用
+        """
+        try:
+            self._queue.put_nowait(data)
+        except queue.Full:
+            pass # 队列满了就丢弃，保证控制链路不被阻塞
+
+    # ==============================================
+    #  内部私有函数
+    # ==============================================
+
+    def _write_loop(self):
+        """后台线程循环：从队列取数据并批量写入"""
+        while self._running or not self._queue.empty():
+            try:
+                # 1. 从队列攒数据
+                count = 0
+                while count < self._batch_size and (self._running or not self._queue.empty()):
+                    try:
+                        synced_data = self._queue.get(timeout=0.05)
+                        self._buffer.append(self._synced_data_to_dict(synced_data))
+                        count += 1
+                    except queue.Empty:
+                        break
+                
+                # 2. 如果攒够了，或者要停止了，就写入
+                if len(self._buffer) >= self._batch_size or (not self._running and self._buffer):
+                    self._flush_buffer()
+
+            except Exception as e:
+                print(f"[SyncedDataLogger] 写入错误: {e}")
+
+    def _flush_buffer(self, force: bool = False):
+        """将缓冲区写入 Parquet"""
+        if not self._buffer:
+            return
+        
+        # 只有当数据量足够或者强制写入时才执行
+        if len(self._buffer) < self._batch_size and not force:
+            return
+
+        try:
+            df = pd.DataFrame(self._buffer)
+            
+            # 如果文件不存在，创建新文件；如果存在，追加写入
+            if not os.path.exists(self._filepath):
+                table = pa.Table.from_pandas(df)
+                pq.write_table(table, self._filepath)
+            else:
+                # 追加模式：读取旧文件 + 合并新数据 + 覆写 (Parquet 不支持原生追加，这是最简单的稳健做法)
+                # 注意：如果数据量极大，建议使用更专业的列式存储库
+                old_df = pd.read_parquet(self._filepath)
+                combined_df = pd.concat([old_df, df], ignore_index=True)
+                table = pa.Table.from_pandas(combined_df)
+                pq.write_table(table, self._filepath)
+            
+            self._buffer = [] # 清空缓冲区
+            
+        except Exception as e:
+            print(f"[SyncedDataLogger] Flush 错误: {e}")
+
+    def _synced_data_to_dict(self, data: SyncedData) -> Dict:
+        """
+        将 SyncedData 展平为一个字典，方便存入 DataFrame
+        包含你要求的所有字段
+        """
+        d = {}
+        
+        # 1. 现实时间
+        d['wall_time'] = data.received_wall_time
+        d['wall_time_str'] = datetime.fromtimestamp(data.received_wall_time).strftime('%Y-%m-%d %H:%M:%S.%f')
+        
+        # 2. 飞控时间
+        d['px4_time_boot_ms'] = data.obs.time_boot_ms
+        
+        # 3. 姿态
+        d['roll'] = data.obs.roll
+        d['pitch'] = data.obs.pitch
+        d['yaw'] = data.obs.yaw
+        d['rollspeed'] = data.obs.rollspeed
+        d['pitchspeed'] = data.obs.pitchspeed
+        d['yawspeed'] = data.obs.yawspeed
+        
+        # 4. 位置
+        d['x'] = data.obs.x
+        d['y'] = data.obs.y
+        d['z'] = data.obs.z
+        d['vx'] = data.obs.vx
+        d['vy'] = data.obs.vy
+        d['vz'] = data.obs.vz
+        
+        # 5. 电机
+        d['motor_1'] = data.obs.motors[0] if len(data.obs.motors) > 0 else 0.0
+        d['motor_2'] = data.obs.motors[1] if len(data.obs.motors) > 1 else 0.0
+        d['motor_3'] = data.obs.motors[2] if len(data.obs.motors) > 2 else 0.0
+        d['motor_4'] = data.obs.motors[3] if len(data.obs.motors) > 3 else 0.0
+        
+        # 6. 上条指令估算时间
+        if data.last_action:
+            d['last_action_px4_time_est'] = data.last_action.time_boot_ms_est
+            # 7. 最新控制指令
+            d['cmd_body_roll_rate'] = data.last_action.body_roll_rate
+            d['cmd_body_pitch_rate'] = data.last_action.body_pitch_rate
+            d['cmd_body_yaw_rate'] = data.last_action.body_yaw_rate
+            d['cmd_thrust'] = data.last_action.thrust
+        else:
+            d['last_action_px4_time_est'] = 0
+            d['cmd_body_roll_rate'] = 0.0
+            d['cmd_body_pitch_rate'] = 0.0
+            d['cmd_body_yaw_rate'] = 0.0
+            d['cmd_thrust'] = 0.0
+            
+        return d
 
 # ==============================================
 # 2. 核心同步类 (DroneDataSync)
@@ -64,7 +231,8 @@ class DroneDataSync:
                  use_queue: bool = True,
                  action_history_len: int = 10,
                  max_queue_size: int = 1000,
-                 sync_window_ms: int = 50):
+                 sync_window_ms: int = 50, 
+                 logger: Optional[SyncedDataLogger] = None):
         """
         初始化数据同步中心
         :param use_condition: 是否启用 Condition 实时流 (推荐用于控制)
@@ -75,6 +243,9 @@ class DroneDataSync:
         self._use_condition = use_condition
         self._use_queue = use_queue
         self._sync_window_ms = sync_window_ms
+
+        # 保存 Logger 引用
+        self._logger = logger
 
         # --- 共享状态 ---
         self._latest_px4_time_est: int = 0  # 最新的飞控时间估算
@@ -268,6 +439,18 @@ class DroneDataSync:
         
         # 5. 【关键】只通知一次！
         self._has_new_data = True
+
+        # 构建 SyncedData 并推送给 Logger
+        if self._logger:
+            # 构建完整的对齐数据包
+            synced_data = SyncedData(
+                obs=ObservationData(**self._latest_obs.__dict__), # 深拷贝观测
+                last_action=ActionData(**self._action_history[-1].__dict__) if self._action_history else None,
+                received_wall_time=time.time() # 记录现实时间
+            )
+            # 推送到日志队列 (非阻塞)
+            self._logger.log_synced_data(synced_data)
+
         self._cv.notify()
         
         # 6. 清空缓存，准备接收下一帧
@@ -394,8 +577,6 @@ class SimTimeKeeper:
                     lambda: self._data_sync.get_latest_px4_time_ms() >= target_ms,
                     timeout=remaining_timeout
                 )
-
-
 
 @dataclass
 class ControlParams:
