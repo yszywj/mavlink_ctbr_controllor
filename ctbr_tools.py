@@ -9,9 +9,11 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from datetime import datetime
+import logging
+logger = logging.getLogger("CTBRTools") 
 
 # ==============================================
-# 1. 数据类定义 (Data Classes)
+# 1. 数据类定义
 # ==============================================
 
 @dataclass
@@ -50,34 +52,25 @@ class ActionData:
 
 @dataclass
 class SyncedData:
-    """最终对齐后的数据，供 RL 使用"""
+    """接收数据与发送指令对齐拼接"""
     obs: ObservationData = field(default_factory=ObservationData)
     last_action: Optional[ActionData] = None
     received_wall_time: float = field(default_factory=time.time)
 
 # ==============================================
-# 4. 新增：同步数据日志记录器 (SyncedDataLogger)
+# 2. 同步数据日志记录器
 # ==============================================
 
 class SyncedDataLogger:
     """
-    专门用于记录对齐后的 SyncedData
-    功能：Queue 缓冲 + 批量 Parquet 写入
-    """
+    专门用于记录对齐后的 SyncedData,Queue 缓冲 + 批量 Parquet 写入"""
     def __init__(self, log_dir: str = "./log_folder", batch_size: int = 100):
         self._log_dir = log_dir
         self._batch_size = batch_size
-        
-        # 确保文件夹存在
         os.makedirs(self._log_dir, exist_ok=True)
-        
-        # 数据队列
         self._queue = queue.Queue(maxsize=10000)
-        
-        # 写入缓冲区
         self._buffer: List[Dict] = []
         
-        # 线程控制
         self._running = False
         self._writer_thread: Optional[threading.Thread] = None
         
@@ -92,7 +85,7 @@ class SyncedDataLogger:
         self._running = True
         self._writer_thread = threading.Thread(target=self._write_loop, daemon=True)
         self._writer_thread.start()
-        print(f"[SyncedDataLogger] 已启动，日志文件: {self._filepath}")
+        logger.info(f"[SyncedDataLogger] 已启动，日志文件: {self._filepath}")
 
     def stop(self):
         """停止日志写入线程，强制刷新剩余数据"""
@@ -102,7 +95,7 @@ class SyncedDataLogger:
         if self._writer_thread:
             self._writer_thread.join(timeout=2.0)
         self._flush_buffer(force=True)
-        print(f"[SyncedDataLogger] 已停止，数据已保存")
+        logger.info(f"[SyncedDataLogger] 已停止，数据已保存")
 
     def log_synced_data(self, data: SyncedData):
         """
@@ -112,17 +105,12 @@ class SyncedDataLogger:
         try:
             self._queue.put_nowait(data)
         except queue.Full:
-            pass # 队列满了就丢弃，保证控制链路不被阻塞
-
-    # ==============================================
-    #  内部私有函数
-    # ==============================================
+            pass
 
     def _write_loop(self):
         """后台线程循环：从队列取数据并批量写入"""
         while self._running or not self._queue.empty():
             try:
-                # 1. 从队列攒数据
                 count = 0
                 while count < self._batch_size and (self._running or not self._queue.empty()):
                     try:
@@ -132,47 +120,39 @@ class SyncedDataLogger:
                     except queue.Empty:
                         break
                 
-                # 2. 如果攒够了，或者要停止了，就写入
                 if len(self._buffer) >= self._batch_size or (not self._running and self._buffer):
                     self._flush_buffer()
 
             except Exception as e:
-                print(f"[SyncedDataLogger] 写入错误: {e}")
+                logger.error(f"[SyncedDataLogger] 写入错误: {e}")
 
     def _flush_buffer(self, force: bool = False):
         """将缓冲区写入 Parquet"""
         if not self._buffer:
             return
         
-        # 只有当数据量足够或者强制写入时才执行
         if len(self._buffer) < self._batch_size and not force:
             return
 
         try:
             df = pd.DataFrame(self._buffer)
             
-            # 如果文件不存在，创建新文件；如果存在，追加写入
             if not os.path.exists(self._filepath):
                 table = pa.Table.from_pandas(df)
                 pq.write_table(table, self._filepath)
             else:
-                # 追加模式：读取旧文件 + 合并新数据 + 覆写 (Parquet 不支持原生追加，这是最简单的稳健做法)
-                # 注意：如果数据量极大，建议使用更专业的列式存储库
                 old_df = pd.read_parquet(self._filepath)
                 combined_df = pd.concat([old_df, df], ignore_index=True)
                 table = pa.Table.from_pandas(combined_df)
                 pq.write_table(table, self._filepath)
             
-            self._buffer = [] # 清空缓冲区
+            self._buffer = []
             
         except Exception as e:
-            print(f"[SyncedDataLogger] Flush 错误: {e}")
+            logger.error(f"[SyncedDataLogger] Flush 错误: {e}")
 
     def _synced_data_to_dict(self, data: SyncedData) -> Dict:
-        """
-        将 SyncedData 展平为一个字典，方便存入 DataFrame
-        包含你要求的所有字段
-        """
+        """将 SyncedData 转换为字典"""
         d = {}
         
         # 1. 现实时间
@@ -207,7 +187,7 @@ class SyncedDataLogger:
         # 6. 上条指令估算时间
         if data.last_action:
             d['last_action_px4_time_est'] = data.last_action.time_boot_ms_est
-            # 7. 最新控制指令
+            # 7. 控制指令
             d['cmd_body_roll_rate'] = data.last_action.body_roll_rate
             d['cmd_body_pitch_rate'] = data.last_action.body_pitch_rate
             d['cmd_body_yaw_rate'] = data.last_action.body_yaw_rate
@@ -222,67 +202,44 @@ class SyncedDataLogger:
         return d
 
 # ==============================================
-# 2. 核心同步类 (DroneDataSync)
+# 3. 核心同步类
 # ==============================================
 
 class DroneDataSync:
     def __init__(self, 
                  use_condition: bool = True, 
-                 use_queue: bool = True,
                  action_history_len: int = 10,
-                 max_queue_size: int = 1000,
                  sync_window_ms: int = 50, 
                  logger: Optional[SyncedDataLogger] = None):
         """
-        初始化数据同步中心
-        :param use_condition: 是否启用 Condition 实时流 (推荐用于控制)
-        :param use_queue: 是否启用 Queue 记录流 (推荐用于日志)
-        :param action_history_len: 保留历史指令的长度
-        :param max_queue_size: Queue 的最大长度
+        :param use_condition: 是否启用实时流
+        :param action_history_len: 历史指令长度
+        :param sync_window_ms: 帧同步时间窗口
+        :param logger: 日志记录器
         """
         self._use_condition = use_condition
-        self._use_queue = use_queue
         self._sync_window_ms = sync_window_ms
-
-        # 保存 Logger 引用
         self._logger = logger
-
-        # --- 共享状态 ---
-        self._latest_px4_time_est: int = 0  # 最新的飞控时间估算
+        self._latest_px4_time_est: int = 0
         self._time_lock = threading.Lock()
+        self._last_update_wall_time: float = 0.0
         
-        # --- 1. Condition 机制 (实时控制) ---
+        # --- Condition 控制 (实时控制) ---
         if self._use_condition:
             self._lock = threading.Lock()
             self._cv = threading.Condition(self._lock)
             self._has_new_data = False
             self._latest_obs: ObservationData = ObservationData()
             self._action_history: Deque[ActionData] = deque(maxlen=action_history_len)
-
-            # 【新增】帧缓存：临时存放未凑齐的单条消息
             self._frame_cache = {
                 'ATTITUDE': None,
                 'LOCAL_POSITION_NED': None,
                 'ACTUATOR_OUTPUT_STATUS': None
             }
-
-        # --- 2. Queue 机制 (完整记录) ---
-        if self._use_queue:
-            self._obs_queue: queue.Queue[ObservationData] = queue.Queue(maxsize=max_queue_size)
-            self._action_queue: queue.Queue[ActionData] = queue.Queue(maxsize=max_queue_size)
-
-    # ==============================================
-    #  写入接口 (由 CTBRController 调用)
-    # ==============================================
-
+    
     def on_new_observation(self, msg):
-        """
-        当收到 PX4 新消息时调用此函数
-        :param msg: pymavlink 的消息对象
-        """
+        """接收飞控消息"""
         msg_type = msg.get_type()
-        
-        # 更新最新的飞控时间
         current_px4_time = 0
         if hasattr(msg, 'time_boot_ms'):
             current_px4_time = msg.time_boot_ms
@@ -293,167 +250,77 @@ class DroneDataSync:
             with self._time_lock:
                 self._latest_px4_time_est = current_px4_time
 
-        # --- Condition 模式写入 (核心修改：先缓存，凑齐再通知) ---
         if self._use_condition:
             with self._lock:
-                # 1. 先把当前消息存入缓存
                 if msg_type in self._frame_cache:
                     self._frame_cache[msg_type] = msg
-                
-                # 2. 【核心】尝试凑齐一帧并发出
                 self._try_emit_synced_frame()
 
-        # --- Queue 模式写入 ---
-        if self._use_queue:
-            # 为了保证 Queue 里的数据是完整的快照，我们每次创建新对象
-            # 注意：这里为了简单，我们只在收到特定消息时才入队，或者你可以选择每次都入队
-            # 这里演示：只有收到 ATTITUDE 时才生成一个完整快照入队
-            if msg_type == 'ATTITUDE':
-                obs_snapshot = ObservationData()
-                # 把当前 Condition 里的完整状态复制出来 (需要在锁外复制，或者优化这里)
-                # 简化版：直接用当前消息更新一个新的
-                obs_snapshot.time_boot_ms = current_px4_time
-                # 注意：简单的 Queue 实现可能会导致数据只有部分更新，
-                # 生产环境建议在这里维护一个专门给 Queue 用的状态机。
-                # 此处为了保持代码简洁，我们主要依赖 Condition 里的逻辑，
-                # Queue 仅做演示或用于对数据完整性要求不高的场景。
-                try:
-                    self._obs_queue.put_nowait(obs_snapshot)
-                except queue.Full:
-                    pass # 队列满了就丢弃，防止内存泄漏
-
     def on_new_action(self, action: ActionData):
-        """
-        当发送了新的控制指令时调用此函数
-        :param action: ActionData 对象
-        """
-        # 补全飞控时间估算
+        """发送了新的控制指令时调用此函数"""
         if action.time_boot_ms_est == 0:
             with self._time_lock:
                 action.time_boot_ms_est = self._latest_px4_time_est
 
-        # --- Condition 模式写入 ---
         if self._use_condition:
             with self._lock:
                 self._action_history.append(action)
 
-        # --- Queue 模式写入 ---
-        if self._use_queue:
-            try:
-                self._action_queue.put_nowait(action)
-            except queue.Full:
-                pass
-
-    # ==============================================
-    #  读取接口 (由用户/RL 调用)
-    # ==============================================
-
     # --- Condition 模式接口 ---
     def wait_for_synced_data(self, timeout: float = None) -> Optional[SyncedData]:
-        """
-        [Condition 模式] 阻塞等待新数据，并自动对齐
-        :return: SyncedData (obs + last_action)
-        """
+        """阻塞等待新数据，并自动对齐"""
         if not self._use_condition:
             return None
 
         with self._cv:
-            # 等待通知
             signaled = self._cv.wait_for(lambda: self._has_new_data, timeout=timeout)
             if not signaled:
-                return None # 超时
+                return None
             
             self._has_new_data = False
-            
-            # 组装数据
             synced = SyncedData()
-            synced.obs = ObservationData(**self._latest_obs.__dict__) # 深拷贝一份
-            
-            # 寻找最近的一条指令
+            synced.obs = ObservationData(**self._latest_obs.__dict__)
             if self._action_history:
-                # 简单策略：取最后一条
-                # 高级策略：可以在这里基于时间戳做更精确的匹配
                 synced.last_action = ActionData(**self._action_history[-1].__dict__)
-            
             return synced
 
-    # --- Queue 模式接口 ---
-    def get_queued_obs(self, block: bool = False, timeout: float = 0.0) -> Optional[ObservationData]:
-        """[Queue 模式] 获取观测数据"""
-        if not self._use_queue: return None
-        try:
-            return self._obs_queue.get(block=block, timeout=timeout)
-        except queue.Empty:
-            return None
-
-    def get_queued_action(self, block: bool = False, timeout: float = 0.0) -> Optional[ActionData]:
-        """[Queue 模式] 获取指令数据"""
-        if not self._use_queue: return None
-        try:
-            return self._action_queue.get(block=block, timeout=timeout)
-        except queue.Empty:
-            return None
-
-    # 新增：公开的时间获取接口
     def get_latest_px4_time_ms(self) -> int:
-        """
-        线程安全地获取当前最新的飞控时间戳
-        :return: time_boot_ms (毫秒)
-        """
+        """获取当前最新的飞控时间戳"""
         with self._time_lock:
             return self._latest_px4_time_est
 
-    # ==============================================
-    #  内部辅助函数
-    # ==============================================
     def _try_emit_synced_frame(self):
-        """
-        [线程安全] 检查缓存：如果3个消息都齐了且时间戳在同一窗口内，就更新数据并通知
-        必须在持有 self._lock 的情况下调用！
-        """
+        """消息集齐，推送完整信息"""
         cache = self._frame_cache
-        
-        # 1. 检查：3个消息是不是都收到了？
         if not (cache['ATTITUDE'] and cache['LOCAL_POSITION_NED'] and cache['ACTUATOR_OUTPUT_STATUS']):
-            return # 没凑齐，直接返回，继续等
+            return
         
-        # 2. 【修复】安全地获取3个时间戳
-        # 先取姿态和位置的时间（这两个肯定有 time_boot_ms）
         t_att = cache['ATTITUDE'].time_boot_ms
         t_pos = cache['LOCAL_POSITION_NED'].time_boot_ms
-        
-        # 再处理电机时间（可能没有 time_boot_ms，没有就用姿态时间代替）
         t_act = t_att
         if hasattr(cache['ACTUATOR_OUTPUT_STATUS'], 'time_boot_ms'):
             t_act = cache['ACTUATOR_OUTPUT_STATUS'].time_boot_ms
         
-        # 3. 检查时间差
         times = [t_att, t_pos, t_act]
         if max(times) - min(times) > self._sync_window_ms:
-            return # 时间差太大，不是同一帧，继续等
+            return 
         
-        # 4. ✅ 凑齐了！合并成完整观测
         self._update_obs_with_msg(self._latest_obs, cache['ATTITUDE'], 'ATTITUDE')
         self._update_obs_with_msg(self._latest_obs, cache['LOCAL_POSITION_NED'], 'LOCAL_POSITION_NED')
         self._update_obs_with_msg(self._latest_obs, cache['ACTUATOR_OUTPUT_STATUS'], 'ACTUATOR_OUTPUT_STATUS')
         
-        # 5. 【关键】只通知一次！
         self._has_new_data = True
+        self._last_update_wall_time = time.time()
 
-        # 构建 SyncedData 并推送给 Logger
         if self._logger:
-            # 构建完整的对齐数据包
             synced_data = SyncedData(
-                obs=ObservationData(**self._latest_obs.__dict__), # 深拷贝观测
+                obs=ObservationData(**self._latest_obs.__dict__),
                 last_action=ActionData(**self._action_history[-1].__dict__) if self._action_history else None,
-                received_wall_time=time.time() # 记录现实时间
+                received_wall_time=time.time()
             )
-            # 推送到日志队列 (非阻塞)
             self._logger.log_synced_data(synced_data)
 
         self._cv.notify()
-        
-        # 6. 清空缓存，准备接收下一帧
         self._frame_cache = {k: None for k in self._frame_cache}
 
     def _update_obs_with_msg(self, obs: ObservationData, msg, msg_type: str):
@@ -477,23 +344,15 @@ class DroneDataSync:
             obs.motors = list(msg.actuator[:4])
 
 # ==============================================
-# 3. 新增：仿真时间守护者 (SimTimeKeeper)
+# 4. 仿真时间对齐
 # ==============================================
 
 class SimTimeKeeper:
-    """
-    仿真时间对齐工具类。
-    作用：替代 time.sleep() 和 asyncio.sleep()，让程序按照仿真世界的时间流速运行。
-    """
+    """仿真时间对齐工具类。替代 time.sleep() 和 asyncio.sleep()，让程序按照仿真时间流速运行。"""
     def __init__(self, data_sync: DroneDataSync):
-        """
-        :param data_sync: 传入 CTBRController 中的 data_sync 对象
-        """
         if not hasattr(data_sync, '_cv'):
-            raise RuntimeError("SimTimeKeeper 需要 DroneDataSync 开启 use_condition=True (默认开启)")
-        
+            raise RuntimeError("SimTimeKeeper 需要 DroneDataSync 开启 use_condition=True!")
         self._data_sync = data_sync
-        # 直接引用 data_sync 的锁和条件变量，实现高效唤醒
         self._cv = data_sync._cv
         self._lock = data_sync._lock
 
@@ -501,31 +360,23 @@ class SimTimeKeeper:
         """获取当前仿真时间 (毫秒)"""
         return self._data_sync.get_latest_px4_time_ms()
 
-    # --- 同步阻塞接口 (用于普通线程) ---
-
     def wait(self, seconds: float, timeout: float = None) -> bool:
         """
         阻塞等待，直到仿真时间流逝指定秒数。
-        替代 time.sleep(seconds)
-        
+        替代 time.sleep(seconds)。
         :param seconds: 仿真世界中需要等待的时长
         :param timeout: 现实世界中的超时时间（防止仿真卡死导致程序死等），None为无限等待
         :return: True 表示等待完成，False 表示现实超时
         """
         start_sim_ms = self._wait_for_first_tick()
         if start_sim_ms == 0:
-            return False # 超时，没连上
-            
+            return False
         target_sim_ms = start_sim_ms + int(seconds * 1000)
         return self._wait_until(target_sim_ms, timeout)
 
     def wait_until(self, target_time_ms: int, timeout: float = None) -> bool:
-        """
-        阻塞等待，直到仿真时间到达某个特定的时间戳
-        """
+        """阻塞等待，直到仿真时间到达某个特定的时间戳"""
         return self._wait_until(target_time_ms, timeout)
-
-    # --- 异步接口 (用于 asyncio 协程) ---
 
     async def wait_async(self, seconds: float, timeout: float = None) -> bool:
         """
@@ -534,36 +385,25 @@ class SimTimeKeeper:
         """
         import asyncio
         loop = asyncio.get_running_loop()
-        
-        # 把同步阻塞的逻辑放到线程池里跑，避免卡主 asyncio 事件循环
         return await loop.run_in_executor(None, self.wait, seconds, timeout)
 
-    # ==============================================
-    #  内部私有函数
-    # ==============================================
-
     def _wait_for_first_tick(self) -> int:
-        """内部函数：等待直到接收到第一帧数据"""
+        """等待直到接收到第一帧数据"""
         with self._lock:
             while self._data_sync.get_latest_px4_time_ms() == 0:
-                # 等待 100ms，如果还没数据再检查一次
-                # 这里不做超时处理，交给外层
                 self._cv.wait(0.1)
             return self._data_sync.get_latest_px4_time_ms()
 
     def _wait_until(self, target_ms: int, timeout: float = None) -> bool:
         """核心等待逻辑"""
         start_wall_time = time.time()
-        
         with self._lock:
             while True:
                 current_ms = self._data_sync.get_latest_px4_time_ms()
                 
-                # 1. 检查是否到达仿真目标时间
                 if current_ms >= target_ms:
                     return True
                 
-                # 2. 检查现实世界是否超时
                 remaining_timeout = None
                 if timeout is not None:
                     elapsed = time.time() - start_wall_time
@@ -571,12 +411,14 @@ class SimTimeKeeper:
                         return False
                     remaining_timeout = timeout - elapsed
                 
-                # 3. 休眠等待新数据到来 (由 on_new_observation 触发 notify)
-                # wait_for 会自动释放锁并在被通知后重新获取锁
                 self._cv.wait_for(
                     lambda: self._data_sync.get_latest_px4_time_ms() >= target_ms,
                     timeout=remaining_timeout
                 )
+
+# ==============================================
+# 5. 控制命令参数类 
+# ==============================================
 
 @dataclass
 class ControlParams:

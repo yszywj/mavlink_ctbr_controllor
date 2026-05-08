@@ -17,12 +17,15 @@ class CTBRController:
     def __init__(self, connection_str='udp:0.0.0.0:14550', timeout=30, log_dir="./log_folder", thrust_output_index=None, 
                 enable_data_sync: bool = True, 
                 use_sync_condition: bool = True,
-                use_sync_queue: bool = True, 
                 enable_logging: bool = True):
         self.master = mavutil.mavlink_connection(connection_str, timeout=timeout)
         logger.info("Waiting for heartbeat...")
         self.master.wait_heartbeat()
         logger.info(f"Connected to PX4 (system {self.master.target_system}, component {self.master.target_component})")
+
+        self._default_hover_x = 0.0
+        self._default_hover_y = 0.0
+        self._default_hover_z = -2.5
 
         self.is_offboard_running = False
         self.offboard_task = None
@@ -31,11 +34,11 @@ class CTBRController:
 
         self.thrust_output_index = thrust_output_index
 
-        # --- 新增：数据监听相关状态 ---
+        # --- 数据监听相关状态 ---
         self.is_monitoring = False
         self.monitor_thread = None
 
-        # --- 新增：发送线程相关状态 ---
+        # --- 发送线程相关状态 ---
         self.is_sending = False
         self.send_thread = None
         self.send_frequency = 50  # 默认50Hz
@@ -53,8 +56,7 @@ class CTBRController:
         if enable_data_sync:
             self.data_sync = DroneDataSync(
                 use_condition=use_sync_condition, 
-                use_queue=use_sync_queue,
-                logger=self._logger # 传入 logger
+                logger=self._logger
             )
 
     # 便捷控制日志启停的方法
@@ -70,27 +72,76 @@ class CTBRController:
 
     # 新增：便捷获取时间守护者的方法
     def get_sim_time_keeper(self) -> SimTimeKeeper:
-        """
-        获取仿真时间管理器实例
-        """
+        """获取仿真时间管理器实例"""
         if not self.data_sync:
             raise RuntimeError("必须开启 enable_data_sync=True 才能使用 SimTimeKeeper")
         return SimTimeKeeper(self.data_sync)
 
     # OFFBOARD 保活指令
-    def send_hover_setpoint(self, x=0, y=0, z=-2.5):
-        self.master.mav.set_attitude_target_send(
-            0, self.master.target_system, self.master.target_component,
-            16,
-            [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 0.0, 0.55
+    def send_hover_setpoint(self, x=0, y=0, z=-10):
+        self.master.mav.set_position_target_local_ned_send(
+            0,
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+            8184,
+            x, y, z,                               # 目标位置坐标
+            0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0,
+            0.0, 0.0
         )
         
     # 改变控制模式
-    def change_control_mode(self, mode=6, is_maintain_offboard=False):
+    def change_control_mode(self, mode=6, is_maintain_offboard=False, default_x=0.0, default_y=0.0, default_z=-2.5, wait_for_data_timeout=1.0):
+        initial_x, initial_y, initial_z = default_x, default_y, default_z
+        use_default = True
+        
+        if self.data_sync and self.data_sync._use_condition:
+            logger.info(f"⏳ 正在等待飞控数据 (超时: {wait_for_data_timeout}s)...")
+            start_wait_time = time.time()
+            found_valid_data = False
+            
+            while (time.time() - start_wait_time) < wait_for_data_timeout:
+                temp_x, temp_y, temp_z = initial_x, initial_y, initial_z
+                is_fresh = False
+                
+                with self.data_sync._lock:
+                    # 安全获取属性，防止 AttributeError
+                    last_update_time = getattr(self.data_sync, '_last_update_wall_time', 0.0)
+                    
+                    # 条件A: 有数据
+                    has_data = self.data_sync._latest_obs.time_boot_ms > 0
+                    
+                    # 条件B: 数据更新时间 晚于 我们开始等待的时间
+                    # (这确保了数据是在我们开始这个函数之后才收到的新数据)
+                    is_new_data = last_update_time > start_wait_time
+                    
+                    if has_data and is_new_data:
+                        temp_x = self.data_sync._latest_obs.x
+                        temp_y = self.data_sync._latest_obs.y
+                        temp_z = self.data_sync._latest_obs.z
+                        is_fresh = True
+                
+                if is_fresh:
+                    initial_x, initial_y, initial_z = temp_x, temp_y, temp_z
+                    use_default = False
+                    found_valid_data = True
+                    logger.info(f"✅ 成功获取当前位置: X={initial_x:.2f}, Y={initial_y:.2f}, Z={initial_z:.2f}")
+                    break
+                
+                time.sleep(0.02)
+            
+            if not found_valid_data:
+                logger.warning(f"⏱️ 等待数据超时，将使用默认/输入位置: X={initial_x:.2f}, Y={initial_y:.2f}, Z={initial_z:.2f}")
+        # ==============================================
+        # 新增结束
+        # ==============================================
+        if use_default:
+            logger.info(f"🚀保活指令，使用默认输入位置: X={initial_x:.2f}, Y={initial_y:.2f}, Z={initial_z:.2f}")
+
         if mode == 6:
             for _ in range(40):
-                self.send_hover_setpoint()
+                self.send_hover_setpoint(initial_x, initial_y, initial_z)
                 time.sleep(0.05)
 
         self.master.mav.command_long_send(
@@ -106,13 +157,30 @@ class CTBRController:
             logger.error(f"Failed to switch to mode {mode}.") 
         
         if is_maintain_offboard and mode == 6:
-            self.start_offboard_maintain()
+            self.start_offboard_maintain(default_x, default_y, default_z)
 
     # OFFBOARD 异步保活协程
     async def _offboard_maintain_coroutine(self):
         try:
             while self.is_offboard_running:
-                self.send_hover_setpoint()
+                # 1. 确定目标坐标
+                target_x = self._default_hover_x
+                target_y = self._default_hover_y
+                target_z = self._default_hover_z
+
+                # 2. 尝试从 data_sync 获取最新位置 (线程安全读取)
+                if self.data_sync and self.data_sync._use_condition:
+                    with self.data_sync._lock:
+                        # 检查时间戳确保数据是有效的
+                        if self.data_sync._latest_obs.time_boot_ms > 0:
+                            target_x = self.data_sync._latest_obs.x
+                            target_y = self.data_sync._latest_obs.y
+                            target_z = self.data_sync._latest_obs.z
+
+                logger.debug(f"保活发送位置指令: X={target_x:.2f}, Y={target_y:.2f}, Z={target_z:.2f}")
+
+                # 3. 发送指令
+                self.send_hover_setpoint(target_x, target_y, target_z)
                 await asyncio.sleep(0.05)
         except asyncio.CancelledError:
             logger.info("OFFBOARD keep-alive task cancelled gracefully")
@@ -120,8 +188,13 @@ class CTBRController:
             logger.info("OFFBOARD maintain coroutine exited")
 
     # 启动 OFFBOARD 保活
-    def start_offboard_maintain(self):
+    def start_offboard_maintain(self, default_x=None, default_y=None, default_z=None):
         if not self.is_offboard_running:
+            # 更新类成员变量中的默认坐标
+            if default_x is not None: self._default_hover_x = default_x
+            if default_y is not None: self._default_hover_y = default_y
+            if default_z is not None: self._default_hover_z = default_z
+
             self.is_offboard_running = True
             self.offboard_task = asyncio.create_task(self._offboard_maintain_coroutine())
             logger.info("OFFBOARD Asynchronous keep-alive has been started")
@@ -235,6 +308,31 @@ class CTBRController:
             for msg_id in message_ids:
                 self.request_message_stream(msg_id, freq_hz)
             logger.info("📡 已请求数据流")
+
+            logger.info("🧹 正在清空 MAVLink 旧数据缓冲区...")
+            start_flush_time = time.time()
+            flushed_packets = 0
+            
+            # 循环清空策略：持续清空直到至少 0.2 秒内没有新数据
+            # 或者最多清空 1 秒防止死循环
+            last_msg_time = time.time()
+            while True:
+                msg = self.master.recv_match(blocking=False)
+                if msg:
+                    flushed_packets += 1
+                    last_msg_time = time.time()
+                else:
+                    # 如果超过 0.2 秒没收到消息，认为缓冲区空了
+                    if time.time() - last_msg_time > 0.2:
+                        break
+                    # 防止 CPU 100%
+                    time.sleep(0.01)
+                
+                # 超时保护
+                if time.time() - start_flush_time > 1.0:
+                    break
+            
+            logger.info(f"🧹 缓冲区清空完成，丢弃了 {flushed_packets} 条旧消息")
             
             # 启动线程
             self.is_monitoring = True
