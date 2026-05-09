@@ -64,7 +64,10 @@ class SyncedData:
 class SyncedDataLogger:
     """
     专门用于记录对齐后的 SyncedData,Queue 缓冲 + 批量 Parquet 写入"""
-    def __init__(self, log_dir: str = "./log_folder", batch_size: int = 100):
+    def __init__(self, 
+                 log_dir: str = "./log_folder", 
+                 batch_size: int = 100,
+                 filename: Optional[str] = None):
         self._log_dir = log_dir
         self._batch_size = batch_size
         os.makedirs(self._log_dir, exist_ok=True)
@@ -74,9 +77,13 @@ class SyncedDataLogger:
         self._running = False
         self._writer_thread: Optional[threading.Thread] = None
         
-        # 生成唯一的文件名
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._filepath = os.path.join(self._log_dir, f"trajectory_{timestamp}.parquet")
+        if filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._filepath = os.path.join(self._log_dir, f"trajectory_{timestamp}.parquet")
+        else:
+            if not filename.endswith('.parquet'):
+                filename += '.parquet'
+            self._filepath = os.path.join(self._log_dir, filename)
 
     def start(self):
         """启动日志写入线程"""
@@ -112,16 +119,17 @@ class SyncedDataLogger:
         while self._running or not self._queue.empty():
             try:
                 count = 0
-                while count < self._batch_size and (self._running or not self._queue.empty()):
+                max_batch = self._batch_size if self._running else float('inf')
+                while count < max_batch and (self._running or not self._queue.empty()):
                     try:
-                        synced_data = self._queue.get(timeout=0.05)
+                        synced_data = self._queue.get(timeout=0.03)
                         self._buffer.append(self._synced_data_to_dict(synced_data))
                         count += 1
                     except queue.Empty:
                         break
                 
                 if len(self._buffer) >= self._batch_size or (not self._running and self._buffer):
-                    self._flush_buffer()
+                    self._flush_buffer(force=not self._running)
 
             except Exception as e:
                 logger.error(f"[SyncedDataLogger] 写入错误: {e}")
@@ -136,20 +144,19 @@ class SyncedDataLogger:
 
         try:
             df = pd.DataFrame(self._buffer)
-            
+            table = pa.Table.from_pandas(df)
+
             if not os.path.exists(self._filepath):
-                table = pa.Table.from_pandas(df)
                 pq.write_table(table, self._filepath)
             else:
-                old_df = pd.read_parquet(self._filepath)
-                combined_df = pd.concat([old_df, df], ignore_index=True)
-                table = pa.Table.from_pandas(combined_df)
-                pq.write_table(table, self._filepath)
+                with pq.ParquetWriter(self._filepath, table.schema, append=True) as writer:
+                    writer.write_table(table)
             
             self._buffer = []
+            logger.debug(f"[SyncedDataLogger] 成功写入 {len(df)} 条数据到 {self._filepath}")
             
         except Exception as e:
-            logger.error(f"[SyncedDataLogger] Flush 错误: {e}")
+            logger.error(f"[SyncedDataLogger] Flush 错误: {e}", exc_info=True)
 
     def _synced_data_to_dict(self, data: SyncedData) -> Dict:
         """将 SyncedData 转换为字典"""
@@ -224,7 +231,6 @@ class DroneDataSync:
         self._time_lock = threading.Lock()
         self._last_update_wall_time: float = 0.0
         
-        # --- Condition 控制 (实时控制) ---
         if self._use_condition:
             self._lock = threading.Lock()
             self._cv = threading.Condition(self._lock)
@@ -266,7 +272,6 @@ class DroneDataSync:
             with self._lock:
                 self._action_history.append(action)
 
-    # --- Condition 模式接口 ---
     def wait_for_synced_data(self, timeout: float = None) -> Optional[SyncedData]:
         """阻塞等待新数据，并自动对齐"""
         if not self._use_condition:
@@ -365,7 +370,7 @@ class SimTimeKeeper:
         阻塞等待，直到仿真时间流逝指定秒数。
         替代 time.sleep(seconds)。
         :param seconds: 仿真世界中需要等待的时长
-        :param timeout: 现实世界中的超时时间（防止仿真卡死导致程序死等），None为无限等待
+        :param timeout: 现实世界中的超时时间，None为无限等待
         :return: True 表示等待完成，False 表示现实超时
         """
         start_sim_ms = self._wait_for_first_tick()
@@ -411,10 +416,15 @@ class SimTimeKeeper:
                         return False
                     remaining_timeout = timeout - elapsed
                 
-                self._cv.wait_for(
-                    lambda: self._data_sync.get_latest_px4_time_ms() >= target_ms,
-                    timeout=remaining_timeout
-                )
+                wait_timeout = min(remaining_timeout, 0.1) if remaining_timeout else 0.1                
+                try:
+                    self._cv.wait_for(
+                        lambda: self._data_sync.get_latest_px4_time_ms() >= target_ms,
+                        timeout=wait_timeout
+                    )
+                except KeyboardInterrupt:
+                    logger.warning("SimTimeKeeper等待被中断")
+                    return False
 
 # ==============================================
 # 5. 控制命令参数类 

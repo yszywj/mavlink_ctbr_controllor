@@ -92,7 +92,7 @@ class CTBRController:
         )
         
     # 改变控制模式
-    def change_control_mode(self, mode=6, is_maintain_offboard=False, default_x=0.0, default_y=0.0, default_z=-2.5, wait_for_data_timeout=1.0):
+    def change_control_mode(self, mode=6, is_maintain_offboard=False, default_x=0.0, default_y=0.0, default_z=-2.5, wait_for_data_timeout=3.0):
         initial_x, initial_y, initial_z = default_x, default_y, default_z
         use_default = True
         
@@ -106,10 +106,7 @@ class CTBRController:
                 is_fresh = False
                 
                 with self.data_sync._lock:
-                    # 安全获取属性，防止 AttributeError
                     last_update_time = getattr(self.data_sync, '_last_update_wall_time', 0.0)
-                    
-                    # 条件A: 有数据
                     has_data = self.data_sync._latest_obs.time_boot_ms > 0
                     
                     # 条件B: 数据更新时间 晚于 我们开始等待的时间
@@ -346,7 +343,7 @@ class CTBRController:
             if self.monitor_thread:
                 self.monitor_thread.join()
             logger.info("🛑 数据监听已停止")
-            self.stop_logging()
+            # self.stop_logging()
 
     # ==============================================
     #  新增代码块：发送线程功能
@@ -385,6 +382,7 @@ class CTBRController:
                 self.send_thread.join()
 
     def update_ctbr_send_params(self, body_roll_rate=None, body_pitch_rate=None, body_yaw_rate=None, thrust=None):
+        """更新发送参数"""
         with self.param_lock:
             if body_roll_rate is not None:
                 self.current_params.body_roll_rate = body_roll_rate
@@ -394,3 +392,32 @@ class CTBRController:
                 self.current_params.body_yaw_rate = body_yaw_rate
             if thrust is not None:
                 self.current_params.thrust = thrust
+    
+    def cleanup(self):
+        """清理与关闭所有功能"""
+        logger.info("🔧 开始执行CTBRController资源清理...")
+        
+        if self.is_sending:
+            logger.info("🛑 正在停止控制指令发送线程...")
+            self.stop_ctbr_send_thread()
+        
+        if self.is_offboard_running:
+            logger.info("🛑 正在停止OFFBOARD保活协程...")
+            self.stop_offboard_maintain()
+        
+        if self.is_monitoring:
+            logger.info("🛑 正在停止数据监听线程...")
+            self.stop_monitoring()
+        
+        if self._logger:
+            logger.info("🛑 正在停止日志记录器并刷新缓冲区...")
+            self._logger.stop()
+        
+        if hasattr(self, 'master') and self.master:
+            logger.info("🔌 正在关闭MAVLink连接...")
+            try:
+                self.master.close()
+            except Exception as e:
+                logger.warning(f"关闭MAVLink连接时出现警告: {e}")
+        
+        logger.info("✅ CTBRController资源清理完成")
