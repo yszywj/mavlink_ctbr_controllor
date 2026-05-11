@@ -149,7 +149,7 @@ class SyncedDataLogger:
             if not os.path.exists(self._filepath):
                 pq.write_table(table, self._filepath)
             else:
-                with pq.ParquetWriter(self._filepath, table.schema, append=True) as writer:
+                with pq.ParquetWriter(self._filepath, table.schema) as writer:
                     writer.write_table(table)
             
             self._buffer = []
@@ -263,7 +263,7 @@ class DroneDataSync:
                 self._try_emit_synced_frame()
 
     def on_new_action(self, action: ActionData):
-        """发送了新的控制指令时调用此函数"""
+        """时间戳填充和动作记录"""
         if action.time_boot_ms_est == 0:
             with self._time_lock:
                 action.time_boot_ms_est = self._latest_px4_time_est
