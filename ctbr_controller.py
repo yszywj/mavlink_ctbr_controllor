@@ -14,10 +14,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("CTBRController")
 
 class CTBRController:
-    def __init__(self, connection_str='udp:0.0.0.0:14550', timeout=30, log_dir="./log_folder", thrust_output_index=None, 
+    def __init__(self, connection_str='udp:0.0.0.0:14550', timeout=30, log_dir="./log_folder",
                 enable_data_sync: bool = True, 
                 use_sync_condition: bool = True,
-                enable_logging: bool = True):
+                enable_logging: bool = True, 
+                log_filename: str = None):
         self.master = mavutil.mavlink_connection(connection_str, timeout=timeout)
         logger.info("Waiting for heartbeat...")
         self.master.wait_heartbeat()
@@ -31,8 +32,6 @@ class CTBRController:
         self.offboard_task = None
         self.is_monitor_ctbr_status = False
         self.is_monitor_ctbr_test_status = False
-
-        self.thrust_output_index = thrust_output_index
 
         # --- 数据监听相关状态 ---
         self.is_monitoring = False
@@ -49,7 +48,7 @@ class CTBRController:
         # 初始化日志记录器
         self._logger: Optional[SyncedDataLogger] = None
         if enable_logging:
-            self._logger = SyncedDataLogger(log_dir=log_dir)
+            self._logger = SyncedDataLogger(log_dir=log_dir, filename=log_filename)
 
         # 将 logger 传递给 DroneDataSync
         self.data_sync: Optional[DroneDataSync] = None
