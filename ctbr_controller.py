@@ -900,6 +900,91 @@ class CTBRController:
             time.sleep(1.0 / frequency)
 
     # ----------------------------------------------------------------------
+    # PX4 parameter helpers
+    # ----------------------------------------------------------------------
+
+    def set_px4_param(
+        self,
+        name: str,
+        value: float,
+        param_type=None,
+        timeout: float = 2.0,
+        retries: int = 3,
+    ) -> bool:
+        """
+        通过 MAVLink PARAM_SET 设置 PX4 参数。
+        适用于 Pegasus 自动启动 PX4、无法进入 PX4 shell 的情况。
+        """
+        if param_type is None:
+            param_type = mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+
+        param_id = name.encode("utf-8")
+        if len(param_id) > 16:
+            raise ValueError(f"PX4 参数名过长: {name}")
+
+        param_id = param_id + b"\x00" * (16 - len(param_id))
+
+        for attempt in range(1, retries + 1):
+            logger.info(f"设置 PX4 参数: {name}={value}，第 {attempt}/{retries} 次")
+
+            with self._send_lock:
+                self.master.mav.param_set_send(
+                    self.master.target_system,
+                    self.master.target_component,
+                    param_id,
+                    float(value),
+                    param_type,
+                )
+
+            deadline = time.time() + timeout
+
+            while time.time() < deadline:
+                msg = self.master.recv_match(
+                    type="PARAM_VALUE",
+                    blocking=True,
+                    timeout=0.2,
+                )
+
+                if msg is None:
+                    continue
+
+                msg_name = msg.param_id
+                if isinstance(msg_name, bytes):
+                    msg_name = msg_name.decode(errors="ignore")
+                msg_name = msg_name.replace("\x00", "").strip()
+
+                if msg_name == name:
+                    got_value = float(msg.param_value)
+                    logger.info(f"PX4 参数确认: {name}={got_value}")
+                    return True
+
+            logger.warning(f"等待 PX4 参数确认超时: {name}")
+
+        logger.error(f"PX4 参数设置失败: {name}={value}")
+        return False
+
+
+    def configure_rl_sitl_params(self) -> bool:
+        params = [
+            ("SIM_BAT_DRAIN", 0.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+            ("COM_LOW_BAT_ACT", 0, mavutil.mavlink.MAV_PARAM_TYPE_INT32),
+            ("COM_FLTT_LOW_ACT", 0, mavutil.mavlink.MAV_PARAM_TYPE_INT32),
+            ("CBRK_SUPPLY_CHK", 894281, mavutil.mavlink.MAV_PARAM_TYPE_INT32),
+            ("BAT_LOW_THR", 0.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+            ("BAT_CRIT_THR", 0.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+            ("BAT_EMERGEN_THR", 0.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+            ("COM_OF_LOSS_T", 10.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+            ("COM_OBL_RC_ACT", 0, mavutil.mavlink.MAV_PARAM_TYPE_INT32),
+        ]
+
+        ok_all = True
+        for name, value, param_type in params:
+            ok = self.set_px4_param(name, value, param_type=param_type)
+            ok_all = ok_all and ok
+
+        return ok_all
+    
+    # ----------------------------------------------------------------------
     # Message stream / receive thread
     # ----------------------------------------------------------------------
 

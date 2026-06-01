@@ -49,15 +49,13 @@ class GoalPoint:
 
 @dataclass
 class CTBRActionLimits:
-    """Safe physical range used after mapping policy actions from [-1, 1]."""
-
-    max_roll_rate: float = 0.35      # rad/s. Start conservative; increase later.
-    max_pitch_rate: float = 0.35     # rad/s
-    max_yaw_rate: float = 0.25       # rad/s
-    hover_thrust: float = 0.56
-    thrust_delta: float = 0.08
-    thrust_min: float = 0.48
-    thrust_max: float = 0.66
+    max_roll_rate: float = 0.10
+    max_pitch_rate: float = 0.10
+    max_yaw_rate: float = 0.08
+    hover_thrust: float = 0.585
+    thrust_delta: float = 0.035
+    thrust_min: float = 0.54
+    thrust_max: float = 0.64
 
 
 @dataclass
